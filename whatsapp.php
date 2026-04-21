@@ -210,9 +210,12 @@ class WhatsAppPlugin extends Plugin
      * Returns the WhatsApp phone number for the ticket owner, or null if
      * the ticket wasn't opened via WhatsApp.
      *
-     * We mark a ticket as "WhatsApp" by storing the phone in the user's
-     * account phone field and setting source='Other' plus the ticket has
-     * a synthesised email on our configured domain.
+     * We recognise a WhatsApp user via (in order of preference):
+     *   1. The 'whatsapp_phone' stamp on their UserAccount extra blob —
+     *      set by the handler on every inbound message. This works for
+     *      pre-existing users whose email isn't on our synthetic domain.
+     *   2. Fallback: an email address on the configured synthetic domain
+     *      (used by users created by the plugin itself).
      */
     private static function getWhatsAppPhone(Ticket $ticket)
     {
@@ -221,20 +224,23 @@ class WhatsAppPlugin extends Plugin
             return null;
         }
 
-        // Preferred: our custom-flag, stored in the ticket's external_id
-        // or as source metadata. Fall back to checking the e-mail domain.
+        // 1. UserAccount extra attribute — preferred
+        if (class_exists('WhatsAppHandler')) {
+            $stamp = WhatsAppHandler::getRememberedPhone($user);
+            if ($stamp) {
+                return $stamp;
+            }
+        }
+
+        // 2. Synthetic email fallback
         $email = $user->getEmail();
         $emailStr = $email ? (string) $email : '';
-
-        // Check if email is on our synthetic domain
-        // (Any instance's config can be checked; we go for any whatsapp.*
-        //  domain for robustness.)
         if (strpos($emailStr, '@') !== false) {
-            $domain = strtolower(substr($emailStr, strpos($emailStr, '@') + 1));
+            $domain = strtolower(substr($emailStr,
+                strpos($emailStr, '@') + 1));
             if (strpos($domain, 'whatsapp') === 0
                 || $domain === 'whatsapp.local'
             ) {
-                // Phone is the local part
                 return substr($emailStr, 0, strpos($emailStr, '@'));
             }
         }
@@ -268,17 +274,86 @@ class WhatsAppPlugin extends Plugin
     /**
      * Convenience: find the enabled instance's config from anywhere.
      * Used by webhook.php which lives outside the plugin class.
+     *
+     * The real osTicket 1.18 API is:
+     *   - PluginManager::allActive()            -> iterable of Plugin
+     *   - Plugin->getActiveInstances()          -> iterable of PluginInstance
+     *   - PluginInstance->getConfig()           -> PluginConfig (our subclass)
+     *
+     * If multiple WhatsApp instances are enabled we just pick the first;
+     * a future enhancement could route based on phone_number_id in the
+     * webhook payload to the matching instance.
      */
     public static function activeConfig()
     {
-        $ps = PluginManager::getActiveInstances('WhatsAppPlugin');
-        if (!$ps) {
+        if (!class_exists('PluginManager')) {
             return null;
         }
-        $first = reset($ps);
-        // $first is a PluginInstance; getConfig() gives PluginConfig
-        return method_exists($first, 'getConfig')
-            ? $first->getConfig()
-            : null;
+
+        // Gather plugins from whichever enumeration API the running
+        // osTicket exposes. allActive() is the 1.17+ way.
+        $plugins = array();
+        try {
+            if (method_exists('PluginManager', 'allActive')) {
+                foreach (PluginManager::allActive() as $p) {
+                    $plugins[] = $p;
+                }
+            } elseif (method_exists('PluginManager', 'allInstalled')) {
+                foreach (PluginManager::allInstalled() as $p) {
+                    if (method_exists($p, 'isActive') && !$p->isActive()) {
+                        continue;
+                    }
+                    $plugins[] = $p;
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[whatsapp] activeConfig enumeration: '
+                . $e->getMessage());
+            return null;
+        }
+
+        foreach ($plugins as $p) {
+            if (!($p instanceof Plugin)) {
+                continue;
+            }
+            // Only interested in our own plugin
+            if (!(method_exists($p, 'getImpl') && $p->getImpl() instanceof self)
+                && !($p instanceof self)
+                && strcasecmp(get_class($p), 'WhatsAppPlugin') !== 0
+            ) {
+                // Not us — check the impl class name via info array as a
+                // fallback (Plugin wraps WhatsAppPlugin in some versions).
+                $info = method_exists($p, 'getInfo') ? $p->getInfo() : null;
+                if (!is_array($info)
+                    || stripos((string) ($info['plugin'] ?? ''),
+                        'WhatsAppPlugin') === false
+                ) {
+                    continue;
+                }
+            }
+
+            // Pick the first active instance
+            $instances = method_exists($p, 'getActiveInstances')
+                ? $p->getActiveInstances()
+                : (method_exists($p, 'getInstances')
+                    ? $p->getInstances() : array());
+
+            foreach ($instances as $inst) {
+                if (!$inst) { continue; }
+                try {
+                    // PluginInstance::getConfig() (via Plugin::getConfig)
+                    $cfg = method_exists($inst, 'getConfig')
+                        ? $inst->getConfig()
+                        : null;
+                    if ($cfg instanceof PluginConfig) {
+                        return $cfg;
+                    }
+                } catch (Throwable $e) {
+                    error_log('[whatsapp] instance getConfig: '
+                        . $e->getMessage());
+                }
+            }
+        }
+        return null;
     }
 }

@@ -115,8 +115,8 @@ class WhatsAppHandler
         // --- Comment-on-existing-ticket shortcut:  "#123 body..." -----------
         if (preg_match('/^#?(\d{3,12})\s+(.+)$/s', $body, $m)) {
             $ticket = Ticket::lookupByNumber($m[1]);
-            if ($ticket && $this->ownerPhone($ticket) === $from) {
-                $this->addReplyTo($ticket, $m[2]);
+            if ($ticket && $this->ticketBelongsTo($ticket, $from)) {
+                $this->addReplyTo($ticket, $m[2], $from);
                 return;
             }
             // fall through and treat as a normal message (we don't leak
@@ -126,7 +126,7 @@ class WhatsAppHandler
         // --- Default path: append to open ticket, else create new -----------
         $ticket = $this->findOpenTicketForPhone($from);
         if ($ticket) {
-            $this->addReplyTo($ticket, $body);
+            $this->addReplyTo($ticket, $body, $from);
             return;
         }
 
@@ -241,38 +241,157 @@ class WhatsAppHandler
     }
 
     /**
-     * User lookup: by our synthetic e-mail <phone>@<domain>. We also
-     * create the user on first contact.
+     * Find an osTicket user that corresponds to this WhatsApp phone
+     * number, or create one on first contact.
+     *
+     * Lookup order (first match wins):
+     *
+     *   1. Our synthetic email <phone>@whatsapp.local — fastest path,
+     *      hits the User.emails index. Used for returning WhatsApp-only
+     *      users we've created before.
+     *
+     *   2. Existing osTicket user whose Contact-Information "phone"
+     *      field resolves to the same number (we compare digits-only
+     *      and match on the trailing 10 digits, so "+55 (11) 98765-4321"
+     *      and "5511987654321" are treated as the same number).
+     *
+     *   3. Create a fresh user with the synthetic email.
+     *
+     * Step 2 is what keeps us from creating a ghost account for a
+     * customer who already exists in your help desk.
      */
     private function findOrCreateUser($phone, array $profile)
     {
-        $email  = $phone . '@' . $this->emailDomain();
-        $user   = User::lookupByEmail($email);
+        // --- 1. synthetic email ---
+        $user = $this->lookupBySyntheticEmail($phone);
         if ($user) {
             return $user;
         }
 
-        $name = !empty($profile['name']) ? $profile['name'] : $phone;
+        // --- 2. existing user by phone on Contact Info form ---
+        $user = $this->lookupByContactPhone($phone);
+        if ($user) {
+            return $user;
+        }
 
-        // UserForm is the 'contact info' form; populate its fields.
+        // --- 3. create a new user ---
+        return $this->createSyntheticUser($phone, $profile);
+    }
+
+    /**
+     * Used by every ticket-tracking helper ("status", "list", comment
+     * shortcuts). Unlike findOrCreateUser() this is read-only and must
+     * return null for an unknown number.
+     */
+    private function findUserByPhone($phone)
+    {
+        $user = $this->lookupBySyntheticEmail($phone);
+        if ($user) {
+            return $user;
+        }
+        return $this->lookupByContactPhone($phone);
+    }
+
+    /* ------------------------------------------------------------------
+     * User lookup internals
+     * ---------------------------------------------------------------- */
+
+    private function lookupBySyntheticEmail($phone)
+    {
+        $email = $phone . '@' . $this->emailDomain();
+        return User::lookupByEmail($email);
+    }
+
+    /**
+     * Find an existing osTicket user by the "phone" field on their
+     * Contact Information form entry.
+     *
+     * form_entry          -> one row per (object_type='U', object_id=user_id)
+     *  form_entry_values  -> one row per field (identified by form_field.name)
+     *
+     * We normalise both sides to digits-only and match the trailing 10
+     * characters, so formatting differences (+, spaces, parens, dashes,
+     * trunk prefixes) don't cause misses. 10 digits is the universal
+     * minimum that uniquely identifies a mobile number in most
+     * countries (Brazil uses 10–11).
+     *
+     * If your user base is multi-country and collisions on the last 10
+     * digits are a worry, make this method stricter (e.g. compare 11
+     * digits, or require an exact equality).
+     */
+    private function lookupByContactPhone($phone)
+    {
+        $digits = preg_replace('/\D+/', '', (string) $phone);
+        if (strlen($digits) < 8) {
+            return null;
+        }
+        // Match last 10 digits, or the full string if it's shorter
+        $needle = substr($digits, -10);
+
+        try {
+            $sql = 'SELECT fe.object_id AS user_id
+                    FROM ' . TABLE_PREFIX . 'form_entry fe
+                    JOIN ' . TABLE_PREFIX . 'form_entry_values fev
+                      ON fev.entry_id = fe.id
+                    JOIN ' . TABLE_PREFIX . 'form_field ff
+                      ON ff.id = fev.field_id
+                    WHERE fe.object_type = \'U\'
+                      AND ff.name = \'phone\'
+                      AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                            COALESCE(fev.value, \'\'),
+                              \'+\', \'\'),
+                              \' \', \'\'),
+                              \'-\', \'\'),
+                              \'(\', \'\'),
+                              \')\', \'\'),
+                              \'.\', \'\')
+                          LIKE ?
+                    ORDER BY fe.updated DESC
+                    LIMIT 1';
+
+            // LIKE '%<last 10 digits>' — trailing match only
+            $like = '%' . $needle;
+
+            if (!class_exists('DbEngine')) {
+                require_once INCLUDE_DIR . 'class.orm.php';
+            }
+
+            // db_query doesn't support prepared statements; escape the
+            // needle (digits only, so already safe, but belt and braces)
+            $like = db_real_escape($like, true);
+            $sql  = str_replace('?', $like, $sql);
+
+            $res = db_query($sql);
+            if ($res && ($row = db_fetch_array($res))) {
+                return User::lookup((int) $row['user_id']);
+            }
+        } catch (Throwable $e) {
+            error_log('[whatsapp] contact-phone lookup: '
+                . $e->getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Last-resort path: create a brand-new user with our synthetic
+     * email. Used for numbers that don't match any existing user.
+     */
+    private function createSyntheticUser($phone, array $profile)
+    {
+        $email = $phone . '@' . $this->emailDomain();
+        $name  = !empty($profile['name']) ? $profile['name'] : $phone;
+
         $vars = array(
             'name'  => $name,
             'email' => $email,
             'phone' => $phone,
         );
-        $errors = array();
-        $user = User::fromVars($vars, true);  // true = create if missing
+        $user = User::fromVars($vars, true);   // true = create if missing
         if (!$user) {
-            // Last-resort fallback: direct create
+            // Race / form-validation edge case — try one more lookup
             $user = User::lookupByEmail($email);
         }
         return $user;
-    }
-
-    private function findUserByPhone($phone)
-    {
-        $email = $phone . '@' . $this->emailDomain();
-        return User::lookupByEmail($email);
     }
 
     private function findOpenTicketForPhone($phone)
@@ -311,16 +430,61 @@ class WhatsAppHandler
         return null;
     }
 
-    private function ownerPhone(Ticket $ticket)
+    /**
+     * True if the ticket's owner can be identified as this WhatsApp
+     * sender, via any of: remembered phone stamp, synthetic email, or
+     * matching Contact-Info phone.
+     *
+     * Used to gate the "#123 some text" shortcut so users can only
+     * comment on tickets they actually own.
+     */
+    private function ticketBelongsTo(Ticket $ticket, $phone)
     {
-        $email = $ticket->getOwner()
-            ? (string) $ticket->getOwner()->getEmail() : '';
-        if (strpos($email, '@') === false) {
-            return null;
+        $owner = $ticket->getOwner();
+        if (!$owner) {
+            return false;
         }
-        $local  = substr($email, 0, strpos($email, '@'));
-        $domain = substr($email, strpos($email, '@') + 1);
-        return ($domain === $this->emailDomain()) ? $local : null;
+
+        $normFrom = WhatsAppClient::normalizePhone($phone);
+
+        // 1. Remembered whatsapp_phone stamp — fastest, most reliable
+        $stamp = self::getRememberedPhone($owner);
+        if ($stamp && self::phonesMatch($stamp, $normFrom)) {
+            return true;
+        }
+
+        // 2. Synthetic <phone>@whatsapp.local email
+        $email = (string) $owner->getEmail();
+        if (strpos($email, '@') !== false) {
+            $local  = substr($email, 0, strpos($email, '@'));
+            $domain = substr($email, strpos($email, '@') + 1);
+            if ($domain === $this->emailDomain()
+                && self::phonesMatch($local, $normFrom)
+            ) {
+                return true;
+            }
+        }
+
+        // 3. Contact-info phone on the user (pre-existing osTicket user)
+        $match = $this->lookupByContactPhone($phone);
+        return $match && $match->getId() === $owner->getId();
+    }
+
+    /**
+     * Loose phone equality: digits only, trailing 10-char match.
+     */
+    public static function phonesMatch($a, $b)
+    {
+        $a = preg_replace('/\D+/', '', (string) $a);
+        $b = preg_replace('/\D+/', '', (string) $b);
+        if ($a === '' || $b === '') {
+            return false;
+        }
+        if ($a === $b) {
+            return true;
+        }
+        $tail = 10;
+        return substr($a, -$tail) === substr($b, -$tail);
     }
 
     /**
@@ -334,6 +498,11 @@ class WhatsAppHandler
             return;
         }
 
+        // Stamp the WhatsApp phone on the user's account so outbound
+        // signals know to push replies back to this number, even for
+        // pre-existing users whose email isn't @whatsapp.local.
+        self::rememberWhatsAppPhone($user, $phone);
+
         $subject = self::truncate(
             preg_replace('/\s+/', ' ', trim($body)),
             60
@@ -343,7 +512,7 @@ class WhatsAppHandler
         }
 
         $vars = array(
-            'source'   => 'API', // closest built-in; the synth domain flags WA
+            'source'   => 'API',
             'name'     => $user->getName(),
             'email'    => (string) $user->getEmail(),
             'phone'    => $phone,
@@ -379,9 +548,17 @@ class WhatsAppHandler
     /**
      * Add an incoming WhatsApp message as a user-message on an existing
      * ticket. This mirrors what the web client portal does.
+     *
+     * $phone is the WhatsApp number the inbound message came from; we
+     * re-stamp it on the user's account so outbound signals know this
+     * user is a WhatsApp user even if they were already in the system.
      */
-    private function addReplyTo(Ticket $ticket, $body)
+    private function addReplyTo(Ticket $ticket, $body, $phone = null)
     {
+        if ($phone && $ticket->getOwner()) {
+            self::rememberWhatsAppPhone($ticket->getOwner(), $phone);
+        }
+
         $vars = array(
             'body'    => $body,
             'mid'     => null,
@@ -396,6 +573,68 @@ class WhatsAppHandler
         if (!$entry) {
             error_log('[whatsapp] postMessage failed: '
                 . print_r($errors, true));
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * WhatsApp phone stamp on the user account.
+     *
+     * osTicket's UserAccount has a free-form 'extra' JSON blob. We store
+     * the user's WhatsApp phone there under 'whatsapp_phone'. This is
+     * the marker that makes getWhatsAppPhone() in whatsapp.php return a
+     * non-null value for THIS user, which is what unlocks outbound
+     * notifications.
+     *
+     * If the user has no account (rare — only agent-created users may
+     * skip having one) we fall back to no-op. Everything still works;
+     * we just won't push outbound messages to that specific user.
+     * ---------------------------------------------------------------- */
+
+    public static function rememberWhatsAppPhone($user, $phone)
+    {
+        if (!$user || !$phone) {
+            return;
+        }
+        $account = method_exists($user, 'getAccount')
+            ? $user->getAccount() : null;
+        if (!$account) {
+            // Create an account shell if missing so we have somewhere to
+            // store the attribute. UserAccount::register creates one
+            // without authentication credentials.
+            try {
+                $account = UserAccount::register($user, array());
+            } catch (Throwable $e) {
+                return;
+            }
+        }
+        if (!$account) {
+            return;
+        }
+        try {
+            $account->setExtraAttr('whatsapp_phone',
+                WhatsAppClient::normalizePhone($phone));
+            $account->save();
+        } catch (Throwable $e) {
+            error_log('[whatsapp] rememberWhatsAppPhone: '
+                . $e->getMessage());
+        }
+    }
+
+    public static function getRememberedPhone($user)
+    {
+        if (!$user) {
+            return null;
+        }
+        $account = method_exists($user, 'getAccount')
+            ? $user->getAccount() : null;
+        if (!$account) {
+            return null;
+        }
+        try {
+            $val = $account->getExtraAttr('whatsapp_phone');
+            return $val ? (string) $val : null;
+        } catch (Throwable $e) {
+            return null;
         }
     }
 
