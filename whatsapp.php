@@ -29,19 +29,25 @@ class WhatsAppPlugin extends Plugin
     /**
      * osTicket calls bootstrap() once per request after plugin is loaded
      * and enabled. This is where we hook signals.
+     *
+     * Important: bootstrap runs VERY early in osTicket::start(), before
+     * the global $cfg is initialised on client-portal and API requests.
+     * So we must not touch $cfg (or anything that touches $cfg like
+     * Ticket/Dept/Topic/Priority helpers, or $this->getConfig()) in
+     * here. We only register closures; the closures fetch config
+     * lazily when they actually fire, which always happens later in the
+     * request lifecycle when $cfg is available.
      */
     public function bootstrap()
     {
-        // We pass the config to every handler so an instance of the plugin
-        // knows its own credentials (1.18 supports multiple instances).
-        $config = $this->getConfig();
+        $self = $this;
 
         // Outbound: agent replies -> WhatsApp
         Signal::connect(
             'threadentry.created',
-            function ($entry) use ($config) {
+            function ($entry) use ($self) {
                 try {
-                    $this->onThreadEntry($entry, $config);
+                    $self->onThreadEntry($entry, $self->getConfig());
                 } catch (Exception $e) {
                     error_log('[whatsapp] threadentry handler: '
                         . $e->getMessage());
@@ -52,9 +58,9 @@ class WhatsAppPlugin extends Plugin
         // Outbound: ticket created -> confirmation to WhatsApp user
         Signal::connect(
             'ticket.created',
-            function ($ticket) use ($config) {
+            function ($ticket) use ($self) {
                 try {
-                    $this->onTicketCreated($ticket, $config);
+                    $self->onTicketCreated($ticket, $self->getConfig());
                 } catch (Exception $e) {
                     error_log('[whatsapp] ticket.created handler: '
                         . $e->getMessage());
@@ -65,12 +71,13 @@ class WhatsAppPlugin extends Plugin
         // Outbound: model updated (catch status changes on Ticket)
         Signal::connect(
             'model.updated',
-            function ($model, $data = null) use ($config) {
+            function ($model, $data = null) use ($self) {
                 if (!($model instanceof Ticket)) {
                     return;
                 }
                 try {
-                    $this->onTicketUpdated($model, $data, $config);
+                    $self->onTicketUpdated($model, $data,
+                        $self->getConfig());
                 } catch (Exception $e) {
                     error_log('[whatsapp] model.updated handler: '
                         . $e->getMessage());
@@ -88,9 +95,9 @@ class WhatsAppPlugin extends Plugin
      * forward agent responses — not user messages (they originated from
      * WhatsApp in the first place), not internal notes, not system events.
      */
-    private function onThreadEntry(ThreadEntry $entry, $config)
+    public function onThreadEntry(ThreadEntry $entry, $config)
     {
-        if (!$config->get('notify_on_reply')) {
+        if (!$config || !$config->get('notify_on_reply')) {
             return;
         }
 
@@ -125,9 +132,9 @@ class WhatsAppPlugin extends Plugin
      * Ticket was just created — send acknowledgement if it came from
      * WhatsApp and confirmations are enabled.
      */
-    private function onTicketCreated(Ticket $ticket, $config)
+    public function onTicketCreated(Ticket $ticket, $config)
     {
-        if (!$config->get('notify_on_create')) {
+        if (!$config || !$config->get('notify_on_create')) {
             return;
         }
 
@@ -152,9 +159,9 @@ class WhatsAppPlugin extends Plugin
      * Catch status changes. model.updated fires for lots of reasons, so
      * we filter by looking at the 'dirty' field set.
      */
-    private function onTicketUpdated(Ticket $ticket, $data, $config)
+    public function onTicketUpdated(Ticket $ticket, $data, $config)
     {
-        if (!$config->get('notify_on_status')) {
+        if (!$config || !$config->get('notify_on_status')) {
             return;
         }
 

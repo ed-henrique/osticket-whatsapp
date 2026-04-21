@@ -135,32 +135,74 @@ class WhatsAppPluginConfig extends PluginConfig
 
     /* ------------------------------------------------------------------
      * Populate dropdowns from the osTicket DB.
+     *
+     * These are called from getOptions(), which runs on EVERY request
+     * once the plugin is enabled — including client-portal and API
+     * requests where the global $cfg isn't initialised yet. Some of
+     * these osTicket helpers dereference $cfg internally (e.g.
+     * Topic::getHelpTopics calls $cfg->getTopicSortMode()), so we
+     * defensively fall back to an empty array + catch any fallout.
+     * The dropdowns will be populated as soon as an admin opens the
+     * plugin config page, which is the only place they're actually
+     * displayed.
      * ---------------------------------------------------------------- */
 
     private static function getDepartments()
     {
-        $out = array();
-        foreach (Dept::getDepartments() as $id => $name) {
-            $out[$id] = $name;
+        if (!self::osticketReady()) {
+            return array();
         }
-        return $out;
+        try {
+            $out = array();
+            foreach (Dept::getDepartments() as $id => $name) {
+                $out[$id] = $name;
+            }
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
     }
 
     private static function getTopics()
     {
-        $out = array();
-        foreach (Topic::getHelpTopics() as $id => $name) {
-            $out[$id] = $name;
+        if (!self::osticketReady()) {
+            return array();
         }
-        return $out;
+        try {
+            $out = array();
+            foreach (Topic::getHelpTopics() as $id => $name) {
+                $out[$id] = $name;
+            }
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
     }
 
     private static function getPriorities()
     {
-        $out = array();
-        foreach (Priority::getPriorities() as $id => $name) {
-            $out[$id] = $name;
+        if (!self::osticketReady()) {
+            return array();
         }
-        return $out;
+        try {
+            $out = array();
+            foreach (Priority::getPriorities() as $id => $name) {
+                $out[$id] = $name;
+            }
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+
+    /**
+     * True when osTicket is initialised enough to query config-dependent
+     * helpers safely. Admin pages set the $cfg global; client / API
+     * entrypoints do not, at the point where plugin bootstrap runs.
+     */
+    private static function osticketReady()
+    {
+        global $cfg;
+        return isset($cfg) && is_object($cfg);
     }
 }
